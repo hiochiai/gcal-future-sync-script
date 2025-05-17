@@ -1,0 +1,353 @@
+// === 設定項目 ===
+// スクリプトを初めて使用する際、または設定を変更する際は、以下の項目を確認・編集してください。
+// 設定方法は2通りあります:
+// 1. このスクリプト内の定数を直接編集する。
+// 2. スクリプトエディタの「プロジェクトの設定」>「スクリプト プロパティ」で設定する（推奨）。
+
+// --- スクリプトプロパティを使用する場合のキー名 ---
+// SOURCE_CALENDAR_IDS_CSV : 同期元のカレンダーID（複数ある場合はカンマ区切りで入力）
+// DESTINATION_CALENDAR_ID : 同期先のカレンダーID
+// DAYS_TO_SYNC            : 同期する日数（今日から何日先までか）
+// NO_COPY_TAG_OVERRIDE    : (任意) NO_COPY_TAGの値を上書きする場合に設定
+
+// --- 直接編集する場合のデフォルト値 ---
+// 同期元のGoogleカレンダーIDの配列。最低1つ指定してください。
+// 例: ['your-source-id1@group.calendar.google.com', 'your-source-id2@gmail.com']
+const DEFAULT_SOURCE_CALENDAR_IDS = [
+  'YOUR_SOURCE_CALENDAR_ID_1@group.calendar.google.com', // TODO: 1つ目のコピー元カレンダーIDに置き換えてください
+  // 'YOUR_SOURCE_CALENDAR_ID_2@group.calendar.google.com'  // TODO: 必要に応じて2つ目以降のIDを追加・コメント解除
+];
+// 同期先のGoogleカレンダーID。
+const DEFAULT_DESTINATION_CALENDAR_ID = 'YOUR_DESTINATION_CALENDAR_ID@group.calendar.google.com'; // TODO: コピー先のカレンダーIDに置き換えてください
+// 今日から何日先までの予定を同期対象とするか。
+const DEFAULT_DAYS_TO_SYNC = 35; // 例: 35日先まで (ユースケースに合わせて調整してください)
+// このタグがタイトルに含まれる予定は同期しません。
+const DEFAULT_NO_COPY_TAG = '#nocopy';
+
+// --- 内部で使用する定数 ---
+// コピー先予定の説明に、元の予定IDを記録するための接頭辞。変更不要です。
+const SOURCE_ID_MARKER_PREFIX = "OriginalEventID:";
+
+/**
+ * メインの同期処理関数。
+ * 複数のコピー元カレンダーから単一のコピー先カレンダーへ予定を同期します。
+ * (新規作成、更新、削除に対応)
+ */
+function syncCalendarEvents() {
+  try {
+    const properties = PropertiesService.getScriptProperties();
+    const sourceCalendarIdsCsv = properties.getProperty('SOURCE_CALENDAR_IDS_CSV');
+    const sourceCalendarIds = sourceCalendarIdsCsv
+                              ? sourceCalendarIdsCsv.split(',').map(id => id.trim()).filter(id => id) // 空のIDを除外
+                              : DEFAULT_SOURCE_CALENDAR_IDS;
+    const destinationCalendarId = properties.getProperty('DESTINATION_CALENDAR_ID') || DEFAULT_DESTINATION_CALENDAR_ID;
+    const daysToSync = parseInt(properties.getProperty('DAYS_TO_SYNC')) || DEFAULT_DAYS_TO_SYNC;
+    const noCopyTag = properties.getProperty('NO_COPY_TAG_OVERRIDE') || DEFAULT_NO_COPY_TAG;
+
+    if (!sourceCalendarIds || sourceCalendarIds.length === 0 || !destinationCalendarId) {
+      Logger.log('エラー: 同期元カレンダーID(1つ以上)または同期先カレンダーIDが設定されていません。スクリプト冒頭の定数またはスクリプトプロパティを確認してください。');
+      return;
+    }
+    if (sourceCalendarIds.includes('YOUR_SOURCE_CALENDAR_ID_1@group.calendar.google.com') || destinationCalendarId === 'YOUR_DESTINATION_CALENDAR_ID@group.calendar.google.com') {
+        Logger.log('警告: カレンダーIDが初期値のままです。実際のIDに置き換えてください。');
+        // 本番環境ではここで return するか、エラーを投げることを検討
+    }
+
+
+    const destinationCalendar = CalendarApp.getCalendarById(destinationCalendarId);
+    if (!destinationCalendar) {
+      Logger.log(`エラー: 同期先カレンダーが見つかりません: ${destinationCalendarId}`);
+      return;
+    }
+
+    const today = new Date();
+    const startDate = new Date(today.getFullYear(), today.getMonth(), today.getDate()); // 今日の0時0分
+    const endDate = new Date(today.getFullYear(), today.getMonth(), today.getDate() + daysToSync); // daysToSync日後の0時0分
+
+    Logger.log(`同期期間: ${startDate.toLocaleDateString()} から ${endDate.toLocaleDateString()} まで (${daysToSync}日間)`);
+    Logger.log(`同期除外タグ: "${noCopyTag}"`);
+
+    // 1. 全てのコピー元カレンダーから予定を取得し、同期対象とスキップ対象に分類
+    const sourceEventsToSync = {}; // Map: { sourceEventId: sourceEvent } (同期対象)
+    const sourceEventIdsToSkip = {}; // Map: { sourceEventId: true } (noCopyTag が付いているもの)
+    let totalSourceEventsFetched = 0;
+
+    for (const sourceCalId of sourceCalendarIds) {
+      if (!sourceCalId) continue; // 空のIDの場合はスキップ
+      const sourceCalendar = CalendarApp.getCalendarById(sourceCalId);
+      if (!sourceCalendar) {
+        Logger.log(`警告: 同期元カレンダーが見つかりません: ${sourceCalId}。このカレンダーはスキップします。`);
+        continue;
+      }
+      Logger.log(`同期元カレンダー "${sourceCalendar.getName()}" (${sourceCalId}) から予定を取得中...`);
+      const sourceEventsRaw = sourceCalendar.getEvents(startDate, endDate);
+      totalSourceEventsFetched += sourceEventsRaw.length;
+
+      for (const srcEvent of sourceEventsRaw) {
+        if (srcEvent.getTitle().includes(noCopyTag)) {
+          sourceEventIdsToSkip[srcEvent.getId()] = true;
+        } else {
+          sourceEventsToSync[srcEvent.getId()] = srcEvent;
+        }
+      }
+    }
+    Logger.log(`全ての同期元カレンダーから合計 ${totalSourceEventsFetched} 件の予定を取得。うち ${Object.keys(sourceEventsToSync).length} 件が同期候補、${Object.keys(sourceEventIdsToSkip).length} 件が "${noCopyTag}" タグによりスキップ対象。`);
+
+    // 2. 同期先のカレンダーから、このスクリプトによって過去にコピーされた可能性のある予定を取得
+    //    (同期期間より少し広めに取得して、期間外になったものを確実に削除できるようにする)
+    const lookbehindDays = 7; // 過去何日分まで遡ってコピー済みイベントを探すか（期間外になったイベント削除のため）
+    const lookaheadDays = daysToSync + 7; // 同期期間より少し先までコピー済みイベントを探すか
+    const destLookupStartDate = new Date(today.getFullYear(), today.getMonth(), today.getDate() - lookbehindDays);
+    const destLookupEndDate = new Date(today.getFullYear(), today.getMonth(), today.getDate() + lookaheadDays);
+
+    const destinationEventsPotentiallyCopiedRaw = destinationCalendar.getEvents(destLookupStartDate, destLookupEndDate);
+    const destinationEventsBySourceId = {}; // Map: { originalSourceEventId: destinationEvent }
+
+    for (const destEvent of destinationEventsPotentiallyCopiedRaw) {
+      const { originalSourceId, originalDescription } = extractSourceInfoFromDescription(destEvent.getDescription());
+      if (originalSourceId) {
+        destinationEventsBySourceId[originalSourceId] = destEvent;
+        destEvent._originalDescription = originalDescription; // 元の説明を一時的に保存
+      }
+    }
+    Logger.log(`同期先カレンダーの検索期間 (${destLookupStartDate.toLocaleDateString()} - ${destLookupEndDate.toLocaleDateString()}) から ${Object.keys(destinationEventsBySourceId).length} 件のコピー済みと思われる予定を検出。`);
+
+    let createdCount = 0;
+    let updatedCount = 0;
+    let deletedCount = 0;
+
+    // 3. 同期処理 - 削除フェーズ
+    // 同期先に存在するが、(いずれかの)同期元に存在しない、期間外になった、または noCopyTag が付いた予定を削除
+    for (const originalSourceId in destinationEventsBySourceId) {
+      const destEvent = destinationEventsBySourceId[originalSourceId];
+      const correspondingSourceEvent = sourceEventsToSync[originalSourceId];
+
+      let shouldDelete = false;
+      if (sourceEventIdsToSkip[originalSourceId]) {
+        shouldDelete = true; // noCopyTag が付いた
+        Logger.log(`削除理由: "${destEvent.getTitle()}" (元ID: ${originalSourceId}) - "${noCopyTag}" タグが追加/存在するため。`);
+      } else if (!correspondingSourceEvent) {
+        // 同期元に存在しない。ただし、同期期間外になっただけの可能性もある。
+        // destEventが現在の同期期間(startDate, endDate)に入っていなければ削除。
+        // (getEventsで取得した時点で期間内のもののはずだが、念のため)
+        if (destEvent.getStartTime().getTime() >= endDate.getTime() || destEvent.getEndTime().getTime() <= startDate.getTime()){
+            // 完全に期間外なら削除 (これは通常起こりにくい。sourceEventsToSyncにない時点で削除候補)
+            shouldDelete = true;
+            Logger.log(`削除理由: "${destEvent.getTitle()}" (元ID: ${originalSourceId}) - 同期元の同期期間内に見つからないため (期間外になった可能性)。`);
+        } else {
+             // 同期期間内のはずなのに sourceEventsToSync にない場合は、純粋に削除されたとみなす
+            shouldDelete = true;
+            Logger.log(`削除理由: "${destEvent.getTitle()}" (元ID: ${originalSourceId}) - 同期元カレンダーから削除されたため。`);
+        }
+      } else {
+        // 対応するソースイベントはあるが、それが現在の同期期間外である場合
+        // (ソースイベントが期間外に移動したが、まだ削除されていないケース)
+        // これは sourceEventsToSync の取得ロジックでカバーされるため、ここでのチェックは冗長かもしれないが、
+        // 念のため destEvent が startDate と endDate の範囲外なら削除対象とする
+         if (destEvent.getStartTime().getTime() >= endDate.getTime() || destEvent.getEndTime().getTime() <= startDate.getTime()){
+            // destEventが現在の同期期間外なら削除
+            // (実際にはsourceEventsToSyncに含まれない時点で削除されるはず)
+         }
+      }
+
+
+      if (shouldDelete) {
+        try {
+          destEvent.deleteEvent();
+          deletedCount++;
+          // Logger.log(`削除実行: "${destEvent.getTitle()}" (元ID: ${originalSourceId})`);
+        } catch (e) {
+          Logger.log(`エラー: 予定 "${destEvent.getTitle()}" (元ID: ${originalSourceId}) の削除に失敗: ${e.toString()}`);
+        }
+      }
+    }
+
+    // 4. 同期処理 - 作成/更新フェーズ
+    for (const sourceId in sourceEventsToSync) {
+      const srcEvent = sourceEventsToSync[sourceId]; // 同期期間内のイベントのみがここに来る
+      const existingDestEvent = destinationEventsBySourceId[sourceId];
+
+      if (sourceEventIdsToSkip[sourceId]) { // noCopyTagタグが付いたものは処理しない (削除フェーズで対応済み)
+          continue;
+      }
+
+      if (existingDestEvent) {
+        // 同期先に予定が存在する場合 → 更新チェック
+        if (eventsAreDifferent(srcEvent, existingDestEvent, existingDestEvent._originalDescription)) {
+          try {
+            updateDestinationEvent(existingDestEvent, srcEvent, noCopyTag); // noCopyTagを渡す
+            updatedCount++;
+          } catch (e) {
+            Logger.log(`エラー: 予定 "${srcEvent.getTitle()}" (元ID: ${sourceId}) の更新に失敗: ${e.toString()}`);
+          }
+        }
+      } else {
+        // 同期先に予定が存在しない場合 → 新規作成
+        try {
+          createDestinationEvent(destinationCalendar, srcEvent, noCopyTag); // noCopyTagを渡す
+          createdCount++;
+        } catch (e) {
+          Logger.log(`エラー: 予定 "${srcEvent.getTitle()}" (元ID: ${sourceId}) の作成に失敗: ${e.toString()}`);
+        }
+      }
+      // APIレート制限を避けるための待機 (任意)
+      // if ((createdCount + updatedCount + deletedCount) % 10 === 0) { // 例: 10処理ごとに待機
+      //   Utilities.sleep(300); // 300ミリ秒待機
+      // }
+    }
+
+    Logger.log(`同期処理完了: ${createdCount} 件作成, ${updatedCount} 件更新, ${deletedCount} 件削除。`);
+
+  } catch (error) {
+    Logger.log(`致命的なエラーが発生しました: ${error.toString()}\nStack: ${error.stack}`);
+  }
+}
+
+/**
+ * 予定の説明欄から元の予定IDと元の説明内容を抽出します。
+ * @param {string} fullDescription 予定の説明欄の全文。
+ * @return {{originalSourceId: string|null, originalDescription: string}}
+ */
+function extractSourceInfoFromDescription(fullDescription) {
+  let originalSourceId = null;
+  let originalDescriptionContent = fullDescription || "";
+
+  if (fullDescription) {
+    const lines = fullDescription.split('\n');
+    // マーカーが最初の行にあることを期待する
+    if (lines.length > 0 && lines[0].startsWith(SOURCE_ID_MARKER_PREFIX)) {
+      originalSourceId = lines[0].substring(SOURCE_ID_MARKER_PREFIX.length).trim();
+      originalDescriptionContent = lines.slice(1).join('\n');
+    }
+  }
+  return { originalSourceId, originalDescription: originalDescriptionContent };
+}
+
+/**
+ * 同期先カレンダーに新しい予定を作成します。説明欄に元の予定IDを記録します。
+ * @param {Calendar} destinationCalendar 同期先のカレンダーオブジェクト。
+ * @param {CalendarEvent} sourceEvent 同期元の予定オブジェクト。
+ * @param {string} noCopyTag (未使用だが将来的な拡張のために保持)
+ */
+function createDestinationEvent(destinationCalendar, sourceEvent, noCopyTag) {
+  const originalDescription = sourceEvent.getDescription() || "";
+  const newDescription = SOURCE_ID_MARKER_PREFIX + sourceEvent.getId() + "\n" + originalDescription;
+  const options = {
+    description: newDescription,
+    location: sourceEvent.getLocation() || "",
+    // guests: sourceEvent.getGuestList().map(g => g.getEmail()).join(','), // 必要に応じてゲストも同期 (通知に注意)
+    // sendInvites: false
+  };
+
+  let newEvent;
+  if (sourceEvent.isAllDayEvent()) {
+    // CalendarEvent.getAllDayStartDate() はその日の開始時刻 (例: 5月17日 00:00:00)
+    // CalendarEvent.getAllDayEndDate() はイベント最終日の翌日の開始時刻 (例: 5月17日の1日イベントなら5月18日 00:00:00)
+    // createAllDayEvent(title, startDate, endDate, options) はこの endDate をそのまま受け入れる
+    newEvent = destinationCalendar.createAllDayEvent(sourceEvent.getTitle(), sourceEvent.getAllDayStartDate(), sourceEvent.getAllDayEndDate(), options);
+  } else {
+    newEvent = destinationCalendar.createEvent(sourceEvent.getTitle(), sourceEvent.getStartTime(), sourceEvent.getEndTime(), options);
+  }
+  Logger.log(`作成: "${sourceEvent.getTitle()}" (元ID: ${sourceEvent.getId()}) を同期先 (新規ID: ${newEvent.getId()}) に作成しました。`);
+}
+
+/**
+ * 同期先の既存の予定を、同期元の予定の内容で更新します。
+ * @param {CalendarEvent} destEvent 更新対象の同期先の予定オブジェクト。
+ * @param {CalendarEvent} sourceEvent 同期元の予定オブジェクト。
+ * @param {string} noCopyTag (未使用だが将来的な拡張のために保持)
+ */
+function updateDestinationEvent(destEvent, sourceEvent, noCopyTag) {
+  const originalDescription = sourceEvent.getDescription() || "";
+  const newDescription = SOURCE_ID_MARKER_PREFIX + sourceEvent.getId() + "\n" + originalDescription;
+
+  destEvent.setTitle(sourceEvent.getTitle());
+  // isAllDayEvent() の状態が変化する場合も setTime で対応可能
+  if (sourceEvent.isAllDayEvent()) {
+      destEvent.setAllDayDate(sourceEvent.getAllDayStartDate()); // 全日イベントの場合、setTimeよりこちらが適切な場合がある
+      // 全日イベントで複数日にまたがる場合は setTime(startDate, endDate) が必要
+      if (sourceEvent.getAllDayStartDate().getTime() !== new Date(sourceEvent.getAllDayEndDate().getTime() - (24*60*60*1000)).getTime()) {
+          destEvent.setTime(sourceEvent.getAllDayStartDate(), sourceEvent.getAllDayEndDate());
+      }
+  } else {
+    destEvent.setTime(sourceEvent.getStartTime(), sourceEvent.getEndTime());
+  }
+  destEvent.setDescription(newDescription);
+  destEvent.setLocation(sourceEvent.getLocation() || "");
+  // 必要に応じて他のプロパティも更新 (例: destEvent.setColor(sourceEvent.getColor());)
+  Logger.log(`更新: "${sourceEvent.getTitle()}" (元ID: ${sourceEvent.getId()}) を同期先 (ID: ${destEvent.getId()}) で更新しました。`);
+}
+
+/**
+ * 同期元の予定と同期先の予定の内容が異なるかどうかを比較します。
+ * @param {CalendarEvent} sourceEvent 同期元の予定。
+ * @param {CalendarEvent} destEvent 同期先の予定。
+ * @param {string} destOriginalDescription 同期先の予定から抽出した元の説明内容。
+ * @return {boolean} 内容が異なれば true、同じであれば false。
+ */
+function eventsAreDifferent(sourceEvent, destEvent, destOriginalDescription) {
+  if (sourceEvent.getTitle() !== destEvent.getTitle()) { Logger.log(`差分検出 (タイトル): "${destEvent.getTitle()}" -> "${sourceEvent.getTitle()}"`); return true; }
+  if (sourceEvent.isAllDayEvent() !== destEvent.isAllDayEvent()) { Logger.log(`差分検出 (全日設定): ${destEvent.isAllDayEvent()} -> ${sourceEvent.isAllDayEvent()}`); return true; }
+
+  if (sourceEvent.isAllDayEvent()) {
+    if (sourceEvent.getAllDayStartDate().getTime() !== destEvent.getAllDayStartDate().getTime()) { Logger.log(`差分検出 (全日開始日): ${destEvent.getAllDayStartDate()} -> ${sourceEvent.getAllDayStartDate()}`); return true; }
+    // 全日イベントの終了日は、1日のイベントの場合、開始日と同じになることがあるため、扱いを慎重に。
+    // getEndTime() や getAllDayEndDate() で比較する。
+    // CalendarEvent.getAllDayEndDate() は排他的な終了日 (最終日の翌日)
+    if (sourceEvent.getAllDayEndDate().getTime() !== destEvent.getEndTime().getTime()) { // destEvent.getEndTime() は destEvent.getAllDayEndDate() と等価のはず
+        Logger.log(`差分検出 (全日終了日): ${destEvent.getEndTime()} -> ${sourceEvent.getAllDayEndDate()}`); return true;
+    }
+  } else {
+    if (sourceEvent.getStartTime().getTime() !== destEvent.getStartTime().getTime()) { Logger.log(`差分検出 (開始時刻): ${destEvent.getStartTime()} -> ${sourceEvent.getStartTime()}`); return true; }
+    if (sourceEvent.getEndTime().getTime() !== destEvent.getEndTime().getTime()) { Logger.log(`差分検出 (終了時刻): ${destEvent.getEndTime()} -> ${sourceEvent.getEndTime()}`); return true; }
+  }
+
+  if ((sourceEvent.getDescription() || "") !== (destOriginalDescription || "")) { Logger.log(`差分検出 (説明): "${destOriginalDescription}" -> "${sourceEvent.getDescription() || ""}"`); return true; }
+  if ((sourceEvent.getLocation() || "") !== (destEvent.getLocation() || "")) { Logger.log(`差分検出 (場所): "${destEvent.getLocation() || ""}" -> "${sourceEvent.getLocation() || ""}"`); return true; }
+
+  // 必要に応じて他のプロパティも比較 (例: 色、ゲストリストなど)
+  // if (sourceEvent.getColor() !== destEvent.getColor()) { Logger.log(`差分検出 (色)`); return true; }
+  return false;
+}
+
+/**
+ * スクリプトのトリガーをセットアップするための関数。
+ * この関数を一度実行すると、syncCalendarEvents が毎日指定した時刻に実行されるようになります。
+ */
+function setupTrigger() {
+  const functionNameToTrigger = 'syncCalendarEvents';
+  // 既存のトリガーを一旦削除（重複設定を防ぐため）
+  const triggers = ScriptApp.getProjectTriggers();
+  let triggerExists = false;
+  for (const trigger of triggers) {
+    if (trigger.getHandlerFunction() === functionNameToTrigger) {
+      ScriptApp.deleteTrigger(trigger);
+      Logger.log(`既存の "${functionNameToTrigger}" トリガーを削除しました。`);
+      // 複数の同名トリガーがありうるので、ここでは triggerExists はセットしない
+    }
+  }
+
+  // 新しいトリガーを設定 (例: 毎日午前2時～3時の間に実行)
+  ScriptApp.newTrigger(functionNameToTrigger)
+      .timeBased()
+      .everyDays(1) // 1日ごと
+      .atHour(2)    // 午前2時台に実行 (正確な時刻はGoogle側で分散されます)
+      .create();
+  Logger.log(`"${functionNameToTrigger}" の日次トリガーを新規に設定しました。毎日午前2時頃に実行されます。`);
+}
+
+/**
+ * 全てのプロジェクトトリガーを削除するヘルパー関数。(開発・テスト用)
+ */
+function deleteAllTriggers() {
+  const triggers = ScriptApp.getProjectTriggers();
+  if (triggers.length === 0) {
+    Logger.log('削除対象のトリガーはありません。');
+    return;
+  }
+  for (const trigger of triggers) {
+    ScriptApp.deleteTrigger(trigger);
+  }
+  Logger.log(`${triggers.length} 件全てのトリガーを削除しました。`);
+}
+
